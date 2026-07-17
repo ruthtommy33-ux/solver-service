@@ -22,18 +22,14 @@ PAGEURL = "https://tma.foxigrow.com"
 
 # The proxy format from the provider is: HOST:PORT:USER:PASS
 # Playwright needs: http://user:pass@host:port
-def parse_proxy(raw_proxy: str) -> Optional[dict]:
+def parse_proxy(raw_proxy: str) -> Optional[str]:
     if not raw_proxy:
         return None
     try:
         parts = raw_proxy.strip().split(':')
         if len(parts) == 4:
             host, port, user, password = parts
-            return {
-                "server": f"http://{host}:{port}",
-                "username": user,
-                "password": password
-            }
+            return f"{user}:{password}@{host}:{port}"
         else:
             logger.warning(f"Unsupported proxy format (expected HOST:PORT:USER:PASS). Found {len(parts)} parts.")
             return None
@@ -41,11 +37,16 @@ def parse_proxy(raw_proxy: str) -> Optional[dict]:
         logger.error(f"Failed to parse proxy: {e}")
         return None
 
-def solve_turnstile(proxy_config: Optional[dict] = None) -> Optional[str]:
+def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
     logger.info("Launching SeleniumBase UC browser...")
     sb = None
     try:
-        sb = sb_cdp.Chrome(guest=True, binary_location="/usr/bin/chromium")
+        chrome_args = {"guest": True, "binary_location": "/usr/bin/chromium"}
+        if proxy_str:
+            logger.info("Applying proxy to SeleniumBase...")
+            chrome_args["proxy"] = proxy_str
+            
+        sb = sb_cdp.Chrome(**chrome_args)
         endpoint_url = sb.get_endpoint_url()
         logger.info(f"CDP endpoint: {endpoint_url}")
 
@@ -53,20 +54,8 @@ def solve_turnstile(proxy_config: Optional[dict] = None) -> Optional[str]:
             # Connect playwright to the SeleniumBase stealth browser
             browser = pw.chromium.connect_over_cdp(endpoint_url)
             
-            # Create a new context. If we have a proxy, apply it here.
-            # Unfortunately connect_over_cdp does not let you easily inject proxy dynamically
-            # to the *existing* default context of that browser instance, 
-            # but we can try creating a new context with the proxy attached.
-            context_args = {}
-            if proxy_config:
-                logger.info(f"Applying proxy: {proxy_config['server']}")
-                context_args["proxy"] = {
-                    "server": proxy_config["server"],
-                    "username": proxy_config["username"],
-                    "password": proxy_config["password"]
-                }
-            
-            context = browser.new_context(**context_args)
+            # Use the default context that was launched with the proxy
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
 
             logger.info(f"Navigating to {PAGEURL}...")
