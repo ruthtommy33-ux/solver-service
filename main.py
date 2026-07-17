@@ -51,6 +51,8 @@ INJECT_JS = f"""
     window.__turnstileInjected = true;
     window.__turnstileToken = null;
     window.__turnstileError = null;
+    window.__turnstileWidgetId = null;
+    window.__turnstileRenderError = null;
 
     var container = document.createElement('div');
     container.id = '__cf_turnstile_solver';
@@ -61,23 +63,36 @@ INJECT_JS = f"""
     script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__onTurnstileLoad';
     script.async = true;
     script.defer = true;
+    script.onerror = function(e) {{
+        window.__turnstileRenderError = 'Script failed to load: ' + String(e);
+        console.log('[Solver] Script load error: ' + e);
+    }};
 
     window.__onTurnstileLoad = function() {{
-        window.turnstile.render('#__cf_turnstile_solver', {{
-            sitekey: '{SITEKEY}',
-            callback: function(token) {{
-                window.__turnstileToken = token;
-                console.log('[Solver] Turnstile token received: ' + token.slice(0, 20) + '...');
-            }},
-            'error-callback': function(code) {{
-                window.__turnstileError = String(code);
-                console.log('[Solver] Turnstile error: ' + code);
-            }},
-            'expired-callback': function() {{
-                window.__turnstileToken = null;
-                console.log('[Solver] Turnstile token expired');
-            }}
-        }});
+        console.log('[Solver] Turnstile API loaded, calling render...');
+        try {{
+            var widgetId = window.turnstile.render('#__cf_turnstile_solver', {{
+                sitekey: '{SITEKEY}',
+                callback: function(token) {{
+                    window.__turnstileToken = token;
+                    console.log('[Solver] Token received: ' + token.slice(0, 20) + '...');
+                }},
+                'error-callback': function(code) {{
+                    window.__turnstileError = String(code);
+                    console.log('[Solver] Error: ' + code);
+                }},
+                'expired-callback': function() {{
+                    window.__turnstileToken = null;
+                    console.log('[Solver] Token expired');
+                }}
+            }});
+            window.__turnstileWidgetId = widgetId;
+            console.log('[Solver] Widget rendered, id=' + widgetId);
+            console.log('[Solver] Container innerHTML length: ' + container.innerHTML.length);
+        }} catch(e) {{
+            window.__turnstileRenderError = String(e);
+            console.log('[Solver] Render error: ' + e);
+        }}
     }};
 
     document.head.appendChild(script);
@@ -124,15 +139,18 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
                 time.sleep(0.5)
                 try:
                     status = sb.execute_script("""(function(){
+                        var container = document.getElementById('__cf_turnstile_solver');
                         return {
                             turnstileExists: typeof window.turnstile !== 'undefined',
                             injected: !!window.__turnstileInjected,
                             token: window.__turnstileToken || null,
                             error: window.__turnstileError || null,
+                            renderError: window.__turnstileRenderError || null,
+                            widgetId: window.__turnstileWidgetId,
                             scriptTags: document.querySelectorAll('script[src*="challenges.cloudflare"]').length,
                             iframeCount: document.querySelectorAll('iframe').length,
-                            headExists: !!document.head,
-                            bodyChildren: document.body ? document.body.children.length : 0
+                            containerExists: !!container,
+                            containerHTML: container ? container.innerHTML.substring(0, 200) : 'NO CONTAINER'
                         };
                     })()""")
                     logger.info(f"Check {attempt}: {status}")
