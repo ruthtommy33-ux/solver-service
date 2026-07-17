@@ -2,7 +2,7 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Install dependencies needed by Playwright and SeleniumBase
+# Install system dependencies for Chromium and virtual display
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -15,15 +15,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Chromium only needed)
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
-# Download SeleniumBase UC chrome driver
-RUN seleniumbase install chromedriver
-
 COPY . .
 
-
-# Run Uvicorn server using Xvfb (virtual display) since SeleniumBase needs a display for non-headless UC mode
+# Run with Xvfb virtual display so Chrome runs in "headed" mode (stealthier than headless)
 CMD sh -c "xvfb-run --server-args=\"-screen 0 1024x768x24\" uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"
