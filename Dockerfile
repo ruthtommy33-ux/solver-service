@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     xvfb \
-    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
