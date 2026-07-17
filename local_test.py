@@ -15,7 +15,7 @@ def run_test():
     
     # Test WITH proxy to confirm full production flow
     print("\nStarting solver WITH proxy (production mode)...")
-    token = solve_turnstile(proxy_str, headless=False)
+    token = solve_turnstile(proxy_str)
     
     if token:
         print("\n[SUCCESS] Token obtained!")

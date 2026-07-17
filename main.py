@@ -86,15 +86,19 @@ INJECT_JS = f"""
 """
 
 
-def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> Optional[str]:
+def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
     """Navigate to the target page, inject Turnstile, let UC browser auto-solve, return token."""
     from seleniumbase import SB
+    import platform
 
-    logger.info("Launching SeleniumBase UC browser...")
+    is_linux = platform.system() == "Linux"
+    logger.info(f"Launching SeleniumBase UC browser (Linux={is_linux})...")
     try:
-        with SB(uc=True, proxy=proxy_str, headless=headless) as sb:
+        # On Linux (Railway), use xvfb=True for virtual display (NOT headless!)
+        # On Windows (local), use headed mode normally
+        with SB(uc=True, proxy=proxy_str, xvfb=is_linux) as sb:
             logger.info(f"Navigating to {PAGEURL}...")
-            sb.open(PAGEURL)
+            sb.uc_open_with_reconnect(PAGEURL, reconnect_time=5)
 
             # Wait for the page body to exist so we can append the Turnstile container
             sb.wait_for_element("body", timeout=30)
@@ -261,7 +265,7 @@ def get_token():
             logger.warning("NO PROXY_URL CONFIGURED! Using datacenter IP (High risk of CAPTCHA block)")
 
         start_time = time.time()
-        token = solve_turnstile(proxy_config, headless=True)
+        token = solve_turnstile(proxy_config)
         elapsed = time.time() - start_time
 
         logger.removeHandler(ch)
