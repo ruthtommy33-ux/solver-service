@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     xvfb \
     python3-tk \
     python3-dev \
+    python3-xlib \
+    scrot \
     curl \
     unzip \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
