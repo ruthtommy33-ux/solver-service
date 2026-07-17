@@ -157,6 +157,12 @@ def root():
 @app.get("/getToken")
 def get_token():
     """Solve a Turnstile captcha and return the token."""
+    import io
+    log_capture_string = io.StringIO()
+    ch = logging.StreamHandler(log_capture_string)
+    ch.setLevel(logging.INFO)
+    logger.addHandler(ch)
+    
     try:
         raw_proxy = os.environ.get("PROXY_URL", "")
         proxy_config = parse_proxy(raw_proxy)
@@ -165,22 +171,27 @@ def get_token():
         token = solve_turnstile(proxy_config, headless=True)
         elapsed = time.time() - start_time
 
+        logger.removeHandler(ch)
+        log_contents = log_capture_string.getvalue()
+
         if token:
             return JSONResponse(content={
                 "success": True,
                 "token": token,
-                "elapsed_s": round(elapsed, 2)
+                "elapsed_s": round(elapsed, 2),
+                "logs": log_contents
             })
         else:
             return JSONResponse(
-                content={"success": False, "error": "Failed to solve Turnstile"},
+                content={"success": False, "error": "Failed to solve Turnstile", "logs": log_contents},
                 status_code=503
             )
     except Exception as e:
         tb = traceback.format_exc()
         logger.error(f"Unhandled exception in getToken: {tb}")
+        logger.removeHandler(ch)
         return JSONResponse(
-            content={"success": False, "error": str(e), "traceback": tb},
+            content={"success": False, "error": str(e), "traceback": tb, "logs": log_capture_string.getvalue()},
             status_code=500
         )
 
