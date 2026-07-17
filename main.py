@@ -157,9 +157,15 @@ def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> O
         return None
 
 
+from fastapi.staticfiles import StaticFiles
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Turnstile Solver API"}
+
+# Create screenshot dir if not exists
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+app.mount("/debug", StaticFiles(directory=SCREENSHOT_DIR), name="static")
 
 
 @app.get("/getToken")
