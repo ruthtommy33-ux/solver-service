@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+turnstile_error_*.png
+turnstile_timeout_*.png
