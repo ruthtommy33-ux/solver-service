@@ -113,26 +113,81 @@ def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> O
             except Exception:
                 pass
 
+            # Give the Turnstile script time to load and create its iframe
             logger.info("Waiting for Turnstile iframe to render...")
-            try:
-                sb.wait_for_element("iframe[src*='challenges.cloudflare.com']", timeout=10)
-                time.sleep(3)  # Give it extra time to fully render the checkbox
-            except Exception:
-                logger.info("Could not find Turnstile iframe in DOM.")
+            time.sleep(5)
 
-            logger.info("Attempting to click Turnstile CAPTCHA (in case it requires interaction)...")
-            try:
-                sb.uc_gui_click_captcha()
-                logger.info("Clicked CAPTCHA using GUI method.")
-            except Exception as e:
-                logger.info(f"GUI click failed: {e}")
-                
-            try:
-                # Fallback: try CDP click directly on the iframe
-                sb.uc_click("iframe[src*='challenges.cloudflare.com']")
-                logger.info("Clicked CAPTCHA using CDP method.")
-            except Exception as e:
-                pass
+            # Discover all iframes and find the Turnstile one
+            iframe_info = sb.execute_script("""
+                var iframes = document.querySelectorAll('iframe');
+                var results = [];
+                for (var i = 0; i < iframes.length; i++) {
+                    var rect = iframes[i].getBoundingClientRect();
+                    results.push({
+                        src: iframes[i].src || '',
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height,
+                        id: iframes[i].id || '',
+                        name: iframes[i].name || ''
+                    });
+                }
+                return results;
+            """)
+            logger.info(f"Found {len(iframe_info) if iframe_info else 0} iframes: {iframe_info}")
+
+            # Find the Turnstile iframe (look for challenges.cloudflare or cf-turnstile)
+            turnstile_iframe = None
+            if iframe_info:
+                for iframe in iframe_info:
+                    src = iframe.get('src', '')
+                    if 'challenges.cloudflare' in src or 'turnstile' in src or 'cf-chl' in src:
+                        turnstile_iframe = iframe
+                        break
+                # If not found by src, pick the first iframe in our container
+                if not turnstile_iframe and iframe_info:
+                    for iframe in iframe_info:
+                        if iframe.get('width', 0) > 50 and iframe.get('height', 0) > 30:
+                            turnstile_iframe = iframe
+                            break
+
+            if turnstile_iframe:
+                logger.info(f"Turnstile iframe found: {turnstile_iframe}")
+                # The checkbox is typically at ~28px from left edge, vertically centered
+                click_x = int(turnstile_iframe['x']) + 28
+                click_y = int(turnstile_iframe['y']) + int(turnstile_iframe['height']) // 2
+                logger.info(f"Clicking at coordinates ({click_x}, {click_y})...")
+
+                # Use CDP Input.dispatchMouseEvent for a real browser click
+                try:
+                    sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mouseMoved", "x": click_x, "y": click_y
+                    })
+                    time.sleep(0.1)
+                    sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mousePressed", "x": click_x, "y": click_y,
+                        "button": "left", "clickCount": 1
+                    })
+                    time.sleep(0.05)
+                    sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mouseReleased", "x": click_x, "y": click_y,
+                        "button": "left", "clickCount": 1
+                    })
+                    logger.info("CDP click dispatched successfully.")
+                except Exception as e:
+                    logger.error(f"CDP click failed: {e}")
+                    # Fallback: try uc_gui_click_captcha
+                    try:
+                        sb.uc_gui_click_captcha()
+                        logger.info("Fallback GUI click used.")
+                    except Exception as e2:
+                        logger.error(f"Fallback GUI click also failed: {e2}")
+            else:
+                logger.warning("No Turnstile iframe found! Trying GUI click as fallback...")
+                try:
+                    sb.uc_gui_click_captcha()
+                    logger.info("Fallback GUI click used.")
+                except Exception as e:
+                    logger.error(f"GUI click failed: {e}")
 
             try:
                 sb.save_screenshot(os.path.join(SCREENSHOT_DIR, "screenshot_after_click.png"))
