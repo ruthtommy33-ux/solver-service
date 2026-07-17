@@ -43,9 +43,9 @@ def parse_proxy(raw_proxy: str) -> Optional[dict]:
 
 def solve_turnstile(proxy_config: Optional[dict] = None) -> Optional[str]:
     logger.info("Launching SeleniumBase UC browser...")
-    sb = sb_cdp.Chrome(guest=True)
-    
+    sb = None
     try:
+        sb = sb_cdp.Chrome(guest=True, binary_location="/usr/bin/chromium")
         endpoint_url = sb.get_endpoint_url()
         logger.info(f"CDP endpoint: {endpoint_url}")
 
