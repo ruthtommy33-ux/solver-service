@@ -123,7 +123,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
             for attempt in range(30):  # Up to 15 seconds
                 time.sleep(0.5)
                 try:
-                    status = sb.execute_script("""
+                    status = sb.execute_script("""return (function(){
                         return {
                             turnstileExists: typeof window.turnstile !== 'undefined',
                             injected: !!window.__turnstileInjected,
@@ -134,7 +134,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
                             headExists: !!document.head,
                             bodyChildren: document.body ? document.body.children.length : 0
                         };
-                    """)
+                    })();""")
                     logger.info(f"Check {attempt}: {status}")
                     if status and status.get('turnstileExists'):
                         api_loaded = True
@@ -151,7 +151,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
                 logger.error("Turnstile API script never loaded! The CDN might be blocked.")
 
             # Discover all iframes
-            iframe_info = sb.execute_script("""
+            iframe_info = sb.execute_script("""return (function(){
                 var iframes = document.querySelectorAll('iframe');
                 var results = [];
                 for (var i = 0; i < iframes.length; i++) {
@@ -165,7 +165,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
                     });
                 }
                 return results;
-            """)
+            })();""")
             logger.info(f"Found {len(iframe_info) if iframe_info else 0} iframes: {iframe_info}")
 
             # Find the Turnstile iframe (look for challenges.cloudflare or cf-turnstile)
@@ -233,12 +233,12 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
             for i in range(60):
                 time.sleep(0.5)
                 try:
-                    token = sb.execute_script("return window.__turnstileToken || null;")
+                    token = sb.execute_script("return (function(){ return window.__turnstileToken || null; })();")
                     if token and len(str(token)) > 10:
                         logger.info(f"SUCCESS! Token obtained in {(i + 1) * 0.5:.1f}s")
                         return token
 
-                    error = sb.execute_script("return window.__turnstileError || null;")
+                    error = sb.execute_script("return (function(){ return window.__turnstileError || null; })();")
                     if error:
                         logger.error(f"Turnstile widget reported error: {error}")
                         # Don't return None on error — reset and keep waiting
