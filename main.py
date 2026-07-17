@@ -117,11 +117,40 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
             except Exception:
                 pass
 
-            # Give the Turnstile script time to load and create its iframe
-            logger.info("Waiting for Turnstile iframe to render...")
-            time.sleep(5)
+            # Wait for the Turnstile API script to load (it loads async)
+            logger.info("Waiting for Turnstile API to load...")
+            api_loaded = False
+            for attempt in range(30):  # Up to 15 seconds
+                time.sleep(0.5)
+                try:
+                    status = sb.execute_script("""
+                        return {
+                            turnstileExists: typeof window.turnstile !== 'undefined',
+                            injected: !!window.__turnstileInjected,
+                            token: window.__turnstileToken || null,
+                            error: window.__turnstileError || null,
+                            scriptTags: document.querySelectorAll('script[src*="challenges.cloudflare"]').length,
+                            iframeCount: document.querySelectorAll('iframe').length,
+                            headExists: !!document.head,
+                            bodyChildren: document.body ? document.body.children.length : 0
+                        };
+                    """)
+                    logger.info(f"Check {attempt}: {status}")
+                    if status and status.get('turnstileExists'):
+                        api_loaded = True
+                        logger.info("Turnstile API loaded!")
+                        time.sleep(3)  # Extra time for iframe to render
+                        break
+                    if status and status.get('token'):
+                        logger.info(f"Token already available! {status['token'][:20]}...")
+                        return status['token']
+                except Exception as e:
+                    logger.error(f"Check {attempt} failed: {e}")
 
-            # Discover all iframes and find the Turnstile one
+            if not api_loaded:
+                logger.error("Turnstile API script never loaded! The CDN might be blocked.")
+
+            # Discover all iframes
             iframe_info = sb.execute_script("""
                 var iframes = document.querySelectorAll('iframe');
                 var results = [];
