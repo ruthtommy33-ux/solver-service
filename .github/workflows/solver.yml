@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: "0 */5 * * *"
 
+# Cancel any previous run when a new one starts
+concurrency:
+  group: solver-service
+  cancel-in-progress: true
+
 jobs:
   run-solver:
     runs-on: ubuntu-latest
@@ -31,6 +36,7 @@ jobs:
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           tzdata \
           locales \
+          xvfb \
           python3-tk \
           python3-dev \
           python3-xlib \
@@ -54,15 +60,14 @@ jobs:
     - name: Quick Solve Test
       env:
         PROXY_URL: ${{ secrets.PROXY_URL }}
-        SCREENSHOT_DIR: /tmp/solver-screenshots
       run: |
         echo "=== Starting solver for a quick test ==="
         python main.py &
         SERVER_PID=$!
-        sleep 5
+        sleep 8
 
         echo "=== Testing /getToken endpoint ==="
-        RESULT=$(curl -s --max-time 120 http://127.0.0.1:8080/getToken)
+        RESULT=$(curl -s --max-time 180 http://127.0.0.1:8080/getToken)
         echo "Result: $RESULT"
 
         # Check if it succeeded
@@ -73,6 +78,7 @@ jobs:
             print('TEST PASSED! Token: ' + data['token'][:40] + '...')
         else:
             print('TEST FAILED: ' + data.get('error', 'unknown'))
+            sys.exit(1)
         "
 
         # Kill the test server
@@ -82,7 +88,6 @@ jobs:
     - name: Start Solver API Server
       env:
         PROXY_URL: ${{ secrets.PROXY_URL }}
-        SCREENSHOT_DIR: /tmp/solver-screenshots
       run: |
         echo "=== Starting Solver API ==="
         python main.py &
@@ -94,6 +99,6 @@ jobs:
         echo "==========================================="
         echo "  STARTING CLOUDFLARE TUNNEL"
         echo "  Look for the .trycloudflare.com URL below"
-        echo "  Use that URL as CUSTOM_SOLVER_URL"
+        echo "  Use that URL as your solver URL"
         echo "==========================================="
         ./cloudflared tunnel --url http://127.0.0.1:8080

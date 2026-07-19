@@ -1,44 +1,64 @@
 """
-Turnstile solver microservice using FastAPI and SeleniumBase CDP mode.
+Turnstile solver microservice using FastAPI and SeleniumBase UC mode.
 
-Strategy (inspired by Michael Mintz / SeleniumBase creator):
-  1. Launch a stealth browser via SeleniumBase UC+CDP mode (no raw WebDriver)
-  2. Navigate to https://tma.foxigrow.com
+Strategy:
+  1. Launch a stealth browser via SeleniumBase UC mode with residential proxy
+  2. Navigate to https://tma.foxigrow.com using uc_open_with_reconnect
   3. Inject the Cloudflare Turnstile widget for our sitekey
-  4. Use sb.solve_captcha() to auto-solve the Turnstile challenge
+  4. Use uc_gui_click_captcha() to auto-solve the Turnstile challenge
   5. Extract the token from window.__turnstileToken callback
   6. Return the token — used by the caller for /captcha/verify API
+
+Designed to run on GitHub Actions with Xvfb (managed by SeleniumBase) + residential proxy.
 """
 
 import os
 import time
 import logging
 import traceback
+import threading
 from typing import Optional
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Turnstile Solver API")
+solve_lock = threading.Lock()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 SITEKEY = "0x4AAAAAADuXG2nt8DMgL_NF"
 PAGEURL = "https://tma.foxigrow.com"
 
-SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", "/tmp")
-
 
 def parse_proxy(raw_proxy: str) -> Optional[str]:
-    """Parse proxy from HOST:PORT:USER:PASS to USER:PASS@HOST:PORT format."""
-    if not raw_proxy:
+    """
+    Parse proxy string into SeleniumBase format (USER:PASS@HOST:PORT).
+    
+    Accepts:
+      - USER:PASS@HOST:PORT  (already correct — pass through)
+      - HOST:PORT:USER:PASS  (legacy format — rearrange)
+    """
+    if not raw_proxy or not raw_proxy.strip():
         return None
+    
+    raw_proxy = raw_proxy.strip()
+    
+    # Format 1: USER:PASS@HOST:PORT — already in SeleniumBase format
+    if '@' in raw_proxy:
+        logger.info("Proxy format: USER:PASS@HOST:PORT (direct)")
+        return raw_proxy
+    
+    # Format 2: HOST:PORT:USER:PASS — legacy format, needs rearranging
     try:
-        parts = raw_proxy.strip().split(':')
+        parts = raw_proxy.split(':')
         if len(parts) == 4:
             host, port, user, password = parts
-            return f"{user}:{password}@{host}:{port}"
+            formatted = f"{user}:{password}@{host}:{port}"
+            logger.info("Proxy format: HOST:PORT:USER:PASS (converted)")
+            return formatted
         else:
-            logger.warning(f"Unsupported proxy format. Expected HOST:PORT:USER:PASS, got {len(parts)} parts.")
+            logger.warning(f"Unsupported proxy format ({len(parts)} parts). "
+                          f"Expected USER:PASS@HOST:PORT or HOST:PORT:USER:PASS")
             return None
     except Exception as e:
         logger.error(f"Failed to parse proxy: {e}")
@@ -52,10 +72,11 @@ INJECT_JS = f"""
     window.__turnstileInjected = true;
     window.__turnstileToken = null;
     window.__turnstileError = null;
+    window.__turnstileWidgetId = null;
 
     var container = document.createElement('div');
     container.id = '__cf_turnstile_solver';
-    container.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647;background:white;padding:5px;';
+    container.style.cssText = 'position:fixed;top:50px;left:50px;z-index:2147483647;background:white;padding:10px;';
     document.body.appendChild(container);
 
     var script = document.createElement('script');
@@ -79,6 +100,7 @@ INJECT_JS = f"""
                     window.__turnstileToken = null;
                 }}
             }});
+            window.__turnstileWidgetId = widgetId;
         }} catch(e) {{
             window.__turnstileError = 'render_failed: ' + String(e);
         }}
@@ -89,93 +111,215 @@ INJECT_JS = f"""
 """
 
 
-def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
-    """Navigate to target page, inject Turnstile, use solve_captcha(), return token."""
+# === Persistent browser state (reuse across requests for speed) ===
+global_sb_context = None
+global_sb = None
+solve_count = 0
+consecutive_failures = 0
+
+
+def solve_turnstile() -> Optional[str]:
+    """Navigate to target page, inject Turnstile, auto-solve, return token."""
     from seleniumbase import SB
     import platform
+    global global_sb_context, global_sb, solve_count, consecutive_failures
 
+    raw_proxy = os.environ.get("PROXY_URL", "")
+    proxy_str = parse_proxy(raw_proxy)
     is_linux = platform.system() == "Linux"
-    logger.info(f"Launching SeleniumBase UC+CDP browser (Linux={is_linux})...")
+
+    if proxy_str:
+        logger.info("Using residential proxy for stealth")
+    else:
+        logger.warning("NO PROXY CONFIGURED — will likely be detected on cloud servers!")
 
     try:
-        # UC mode auto-activates CDP mode on sb.open()
-        # xvfb=True on Linux creates a virtual display (appears headed to Cloudflare)
-        with SB(uc=True, proxy=proxy_str, xvfb=is_linux, use_chromium=True, ad_block=True, locale_code="en") as sb:
-            logger.info(f"Navigating to {PAGEURL}...")
-            sb.open(PAGEURL)
-            sb.wait_for_element("body", timeout=30)
-
-            logger.info("Injecting Turnstile widget...")
-            try:
-                sb.execute_script(INJECT_JS)
-            except Exception as e:
-                logger.error(f"Failed to inject widget: {e}")
-                return None
-
-            # Wait for the Turnstile API script to load
-            logger.info("Waiting for Turnstile API to load...")
-            api_loaded = False
-            for attempt in range(20):
-                time.sleep(0.5)
+        # Restart browser if first time, used 100+ times, or failed 3+ times in a row
+        if global_sb is None or solve_count >= 100 or consecutive_failures >= 3:
+            logger.info(f"Browser state (count={solve_count}, failures={consecutive_failures}). Launching fresh browser.")
+            consecutive_failures = 0
+            if global_sb_context is not None:
                 try:
-                    loaded = sb.execute_script("typeof window.turnstile !== 'undefined'")
-                    if loaded:
-                        api_loaded = True
-                        logger.info(f"Turnstile API loaded after {(attempt + 1) * 0.5:.1f}s")
-                        break
+                    global_sb_context.__exit__(None, None, None)
                 except Exception:
                     pass
+                global_sb = None
+                global_sb_context = None
+                time.sleep(1)
 
-            if not api_loaded:
-                logger.error("Turnstile API never loaded!")
-                return None
+            logger.info("Launching SeleniumBase UC browser...")
+            # xvfb=True on Linux: let SeleniumBase manage the virtual display
+            # This is critical — SB's internal CAPTCHA solving (uc_gui_click_captcha)
+            # requires SB to own the Xvfb lifecycle for proper coordination.
+            # use_chromium=True: Chrome 137+ removed --load-extension; Chromium keeps it
+            # (needed for proxy extension loading).
+            global_sb_context = SB(
+                uc=True,
+                proxy=proxy_str,
+                xvfb=is_linux,
+                headless=False,
+                use_chromium=True,
+                ad_block=True,
+                locale_code="en",
+            )
+            global_sb = global_sb_context.__enter__()
+            solve_count = 0
 
-            # Give widget time to render the iframe
-            time.sleep(3)
+            logger.info(f"Opening {PAGEURL} with uc_open_with_reconnect...")
+            global_sb.uc_open_with_reconnect(PAGEURL, reconnect_time=5)
+        else:
+            logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
+            try:
+                global_sb.uc_open_with_reconnect(PAGEURL, reconnect_time=3)
+            except Exception:
+                global_sb.open(PAGEURL)
 
-            # Check if token was auto-granted (invisible mode on trusted environments)
+        solve_count += 1
+        sb = global_sb
+
+        # Wait for the page body so we can inject the Turnstile container
+        sb.wait_for_element("body", timeout=30)
+
+        logger.info("Injecting Turnstile widget...")
+        try:
+            sb.execute_script(INJECT_JS)
+        except Exception as e:
+            logger.error(f"Failed to inject widget: {e}")
+            consecutive_failures += 1
+            return None
+
+        # Wait for the Turnstile API script to load (async)
+        logger.info("Waiting for Turnstile API to load...")
+        api_loaded = False
+        for attempt in range(30):  # Up to 15 seconds
+            time.sleep(0.5)
+            try:
+                status = sb.execute_script("""(function(){
+                    return {
+                        turnstileExists: typeof window.turnstile !== 'undefined',
+                        injected: !!window.__turnstileInjected,
+                        token: window.__turnstileToken || null,
+                        error: window.__turnstileError || null
+                    };
+                })()""")
+
+                if status and status.get('turnstileExists'):
+                    api_loaded = True
+                    logger.info(f"Turnstile API loaded after {(attempt + 1) * 0.5:.1f}s")
+                    time.sleep(3)  # Extra time for iframe to render
+                    break
+                if status and status.get('token'):
+                    logger.info("Token auto-granted during API load wait!")
+                    consecutive_failures = 0
+                    return status['token']
+            except Exception:
+                pass
+
+        if not api_loaded:
+            logger.error("Turnstile API script never loaded!")
+
+        # Check if token was auto-granted (invisible mode on trusted environments)
+        token = sb.execute_script("window.__turnstileToken || null")
+        if token and len(str(token)) > 10:
+            logger.info("Token auto-granted (invisible solve)!")
+            consecutive_failures = 0
+            return token
+
+        # === Try multiple solving strategies ===
+
+        # Strategy 1: uc_gui_click_captcha (best for Turnstile on Linux with Xvfb)
+        logger.info("Strategy 1: Attempting uc_gui_click_captcha()...")
+        try:
+            sb.uc_gui_click_captcha()
+            logger.info("uc_gui_click_captcha() completed")
+            time.sleep(2)
             token = sb.execute_script("window.__turnstileToken || null")
             if token and len(str(token)) > 10:
-                logger.info("Token auto-granted (invisible solve)!")
+                logger.info("Token obtained via uc_gui_click_captcha!")
+                consecutive_failures = 0
                 return token
+        except Exception as e:
+            logger.warning(f"uc_gui_click_captcha() failed: {e}")
 
-            # Use SeleniumBase's built-in captcha solver (clicks Turnstile checkbox)
-            logger.info("Attempting sb.solve_captcha()...")
+        # Strategy 2: solve_captcha (SeleniumBase's built-in solver)
+        logger.info("Strategy 2: Attempting sb.solve_captcha()...")
+        try:
+            sb.solve_captcha()
+            logger.info("solve_captcha() completed")
+            time.sleep(2)
+            token = sb.execute_script("window.__turnstileToken || null")
+            if token and len(str(token)) > 10:
+                logger.info("Token obtained via solve_captcha!")
+                consecutive_failures = 0
+                return token
+        except Exception as e:
+            logger.warning(f"solve_captcha() failed: {e}")
+
+        # Strategy 3: Direct click on the Turnstile widget container
+        logger.info("Strategy 3: Attempting uc_click on widget...")
+        try:
+            sb.uc_click("#__cf_turnstile_solver")
+            logger.info("uc_click completed")
+        except Exception as e:
+            logger.warning(f"uc_click failed: {e}")
+
+        # Poll for the token (up to 30s)
+        logger.info("Waiting for Turnstile token (up to 30s)...")
+        for i in range(60):
+            time.sleep(0.5)
             try:
-                sb.solve_captcha()
-                logger.info("solve_captcha() completed")
-            except Exception as e:
-                logger.warning(f"solve_captcha() exception: {e}")
-                # Fallback: try uc_gui_click_captcha
-                try:
-                    sb.uc_gui_click_captcha()
-                    logger.info("uc_gui_click_captcha() completed")
-                except Exception as e2:
-                    logger.warning(f"uc_gui_click_captcha() also failed: {e2}")
+                token = sb.execute_script("window.__turnstileToken || null")
+                if token and len(str(token)) > 10:
+                    logger.info(f"SUCCESS! Token obtained in {(i + 1) * 0.5:.1f}s")
+                    consecutive_failures = 0
+                    return token
 
-            # Poll for the token (up to 30s)
-            logger.info("Waiting for Turnstile token (up to 30s)...")
-            for i in range(60):
-                time.sleep(0.5)
-                try:
-                    token = sb.execute_script("window.__turnstileToken || null")
-                    if token and len(str(token)) > 10:
-                        logger.info(f"SUCCESS! Token obtained in {(i + 1) * 0.5:.1f}s")
-                        return token
+                error = sb.execute_script("window.__turnstileError || null")
+                if error:
+                    logger.warning(f"Turnstile widget error: {error}")
+                    # Reset error and try to reset the widget
+                    sb.execute_script("""
+                        window.__turnstileError = null;
+                        if (window.turnstile && window.__turnstileWidgetId !== null) {
+                            try { window.turnstile.reset(window.__turnstileWidgetId); } catch(e) {}
+                        }
+                    """)
 
-                    error = sb.execute_script("window.__turnstileError || null")
-                    if error:
-                        logger.error(f"Turnstile error: {error}")
-                except Exception:
-                    pass
+                # At 10 seconds, try clicking again
+                if i == 20:
+                    logger.info("Retrying click on Turnstile widget...")
+                    try:
+                        sb.uc_gui_click_captcha()
+                    except Exception:
+                        try:
+                            sb.uc_click("#__cf_turnstile_solver")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-            logger.error("Timeout: No Turnstile token after 30s")
-            return None
+        logger.error("Timeout: No Turnstile token after 30s")
+        raise Exception("Turnstile timeout")
 
     except Exception as e:
         logger.error(f"Error during solve: {e}")
         logger.error(traceback.format_exc())
+        consecutive_failures += 1
         return None
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Ensure the browser closes when the server shuts down."""
+    global global_sb_context, global_sb
+    if global_sb_context is not None:
+        logger.info("Shutting down global browser instance...")
+        try:
+            global_sb_context.__exit__(None, None, None)
+        except Exception:
+            pass
+        global_sb = None
+        global_sb_context = None
 
 
 @app.get("/")
@@ -183,42 +327,37 @@ def root():
     return {"status": "ok", "service": "Turnstile Solver API"}
 
 
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-
 @app.get("/getToken")
+@app.get("/gettoken")
 def get_token():
-    """Solve a Turnstile captcha and return the token."""
-    try:
-        raw_proxy = os.environ.get("PROXY_URL", "")
-        proxy_config = parse_proxy(raw_proxy)
-
-        if proxy_config:
-            logger.info("Using configured PROXY_URL")
-        else:
-            logger.warning("NO PROXY_URL CONFIGURED!")
-
+    """Solve a Turnstile captcha and return the token. Auto-retries up to 3 times."""
+    with solve_lock:
+        max_retries = 3
         start_time = time.time()
-        token = solve_turnstile(proxy_config)
-        elapsed = time.time() - start_time
 
-        if token:
-            return JSONResponse(content={
-                "success": True,
-                "token": token,
-                "elapsed_s": round(elapsed, 2)
-            })
-        else:
-            return JSONResponse(
-                content={"success": False, "error": "Failed to solve Turnstile"},
-                status_code=503
-            )
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(f"Unhandled exception: {tb}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Solve attempt {attempt}/{max_retries}...")
+                token = solve_turnstile()
+
+                if token:
+                    elapsed = time.time() - start_time
+                    return JSONResponse(content={
+                        "success": True,
+                        "token": token,
+                        "elapsed_s": round(elapsed, 2),
+                        "attempts": attempt
+                    })
+                else:
+                    logger.warning(f"Attempt {attempt} failed, "
+                                  f"{'retrying...' if attempt < max_retries else 'giving up.'}")
+            except Exception as e:
+                logger.error(f"Attempt {attempt} error: {e}")
+
+        elapsed = time.time() - start_time
         return JSONResponse(
-            content={"success": False, "error": str(e)},
-            status_code=500
+            content={"success": False, "error": "Failed after all retries", "elapsed_s": round(elapsed, 2)},
+            status_code=503
         )
 
 
